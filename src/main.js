@@ -45,6 +45,8 @@ const params = {
     densityMin: 0.2, // Multiplier for wallThickness
     densityMax: 1.0,
     jitter: 0, // Random node displacement ratio relative to cellSize
+    gooey: false,
+    resolution: 60,
 
     // Appearance
     preset: 'Custom',
@@ -133,7 +135,7 @@ function generate() {
 const gui = new GUI({ title: 'LatticeLab' });
 
 const typeFolder = gui.addFolder('Lattice Type');
-typeFolder.add(params, 'type', ['cubic', 'octet', 'bcc', 'diamond', 'kelvin', 'gyroid']).name('Type').onChange(generate);
+typeFolder.add(params, 'type', ['cubic', 'octet', 'bcc', 'diamond', 'kelvin']).name('Type').onChange(generate);
 
 
 const dimFolder = gui.addFolder('Dimensions');
@@ -146,12 +148,24 @@ cellFolder.add(params, 'cellSize', 5, 50).name('Cell Size (mm)').onChange(genera
 cellFolder.add(params, 'wallThickness', 0.5, 5).name('Wall Thickness (mm)').onChange(generate);
 
 const advFolder = gui.addFolder('Advanced Geometry');
-advFolder.add(params, 'variableDensity').name('Variable Density').onChange(generate);
+advFolder.add(params, 'variableDensity').name('Variable Density').onChange(updateDensityVisibility);
 advFolder.add(params, 'densityAxis', ['X', 'Y', 'Z']).name('Gradient Axis').onChange(generate);
-advFolder.add(params, 'densityMin', 0.1, 1.5).name('Min Density Factor').onChange(generate);
-advFolder.add(params, 'densityMax', 0.1, 1.5).name('Max Density Factor').onChange(generate);
+advFolder.add(params, 'densityMin', 0.1, 2.0).name('Min Density Factor').onChange(generate);
+advFolder.add(params, 'densityMax', 0.1, 2.0).name('Max Density Factor').onChange(generate);
 advFolder.add(params, 'jitter', 0, 0.5).name('Jitter (0-0.5)').onChange(generate);
+advFolder.add(params, 'gooey').name('Gooey Mode (Slow)').onChange(updateGooeyVisibility);
+advFolder.add(params, 'resolution', 20, 150, 1).name('Resolution').onChange(generate);
 
+function updateGooeyVisibility() {
+    // Show/Hide resolution based on gooey mode
+    // Note: lil-gui doesn't simplify hiding well without references.
+    // simpler to just regen.
+    generate();
+}
+
+function updateDensityVisibility() {
+    generate();
+}
 const sceneFolder = gui.addFolder('Appearance');
 sceneFolder.add(params, 'preset', Object.keys(presets)).name('Material Preset').onChange(name => {
     const p = presets[name];

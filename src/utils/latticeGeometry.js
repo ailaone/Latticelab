@@ -2,17 +2,154 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { MarchingCubes } from 'three/examples/jsm/objects/MarchingCubes.js';
 
+
 export class LatticeGenerator {
     static generate(params) {
+        if (params.gooey) {
+            return this.generateImplicitLattice(params);
+        }
+
         switch (params.type) {
             case 'cubic': return this.generateCubic(params);
             case 'octet': return this.generateOctet(params);
             case 'bcc': return this.generateBCC(params);
             case 'diamond': return this.generateDiamond(params);
             case 'kelvin': return this.generateKelvin(params);
-            case 'gyroid': return this.generateGyroid(params);
+
             default: return new THREE.BufferGeometry();
         }
+    }
+
+
+    static generateImplicitLattice(params) {
+        console.time('GooeyGen');
+        const segments = [];
+        const originalCreateStrut = this.createStrut;
+
+        // 1. Harvest Segments
+        try {
+            // Override createStrut to collect data instead of building geometry
+            this.createStrut = (vStart, vEnd, radius) => {
+                segments.push({ start: vStart.clone(), end: vEnd.clone(), radius });
+                return new THREE.BufferGeometry();
+            };
+
+            // Trigger generation with gooey=false to avoid recursion
+            const tempParams = { ...params, gooey: false };
+            this.generate(tempParams);
+
+        } finally {
+            this.createStrut = originalCreateStrut;
+        }
+
+        console.log(`Gooey: Harvested ${segments.length} segments.`);
+
+        // 2. Setup Marching Cubes
+        const resolution = params.resolution || 60;
+        const mc = new MarchingCubes(resolution, new THREE.MeshBasicMaterial(), false, false);
+
+        const f = mc.field;
+        f.fill(0);
+
+        const size = Math.max(params.width, params.height, params.depth);
+        const halfSize = size / 2;
+
+        const worldToGrid = (v) => {
+            const x = Math.floor((v.x + halfSize) / size * resolution);
+            const y = Math.floor((v.y + halfSize) / size * resolution);
+            const z = Math.floor((v.z + halfSize) / size * resolution);
+            return { x, y, z };
+        };
+
+        console.time('Rasterize');
+        const p = new THREE.Vector3();
+        const ab = new THREE.Vector3();
+        const ap = new THREE.Vector3();
+
+        for (const seg of segments) {
+            const padding = seg.radius * 2.5;
+            const min = new THREE.Vector3().copy(seg.start).min(seg.end).subScalar(padding);
+            const max = new THREE.Vector3().copy(seg.start).max(seg.end).addScalar(padding);
+
+            const gMin = worldToGrid(min);
+            const gMax = worldToGrid(max);
+
+            gMin.x = Math.max(0, gMin.x); gMin.y = Math.max(0, gMin.y); gMin.z = Math.max(0, gMin.z);
+            gMax.x = Math.min(resolution - 1, gMax.x); gMax.y = Math.min(resolution - 1, gMax.y); gMax.z = Math.min(resolution - 1, gMax.z);
+
+            ab.subVectors(seg.end, seg.start);
+            const abLenSq = ab.lengthSq();
+            const rSq = seg.radius * seg.radius;
+
+            for (let k = gMin.z; k <= gMax.z; k++) {
+                const wz = (k / resolution - 0.5) * size;
+                for (let j = gMin.y; j <= gMax.y; j++) {
+                    const wy = (j / resolution - 0.5) * size;
+                    for (let i = gMin.x; i <= gMax.x; i++) {
+                        const wx = (i / resolution - 0.5) * size;
+
+                        p.set(wx, wy, wz);
+                        ap.subVectors(p, seg.start);
+
+                        let t = ap.dot(ab);
+                        if (abLenSq > 0) t /= abLenSq;
+                        t = Math.max(0, Math.min(1, t));
+
+                        const cx = ap.x - t * ab.x;
+                        const cy = ap.y - t * ab.y;
+                        const cz = ap.z - t * ab.z;
+                        const distSq = cx * cx + cy * cy + cz * cz;
+
+                        // Metaball falloff 
+                        const val = rSq / (distSq + 0.0001);
+                        f[i + j * resolution + k * resolution * resolution] += val;
+                    }
+                }
+            }
+        }
+        console.timeEnd('Rasterize');
+
+        // 3. Generate Geometry
+        mc.isolation = 1.0;
+        mc.update();
+
+        if (!mc.geometry) return new THREE.BufferGeometry();
+
+        const geo = mc.geometry.clone();
+
+        // Adaptive Scaling (Robust to MC implementation)
+        geo.computeBoundingBox();
+        const box = geo.boundingBox;
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+
+        // 1. Center
+        geo.translate(-center.x, -center.y, -center.z);
+
+        // 2. Scale to fit Size
+        const rawSizeX = box.max.x - box.min.x;
+        const rawSizeY = box.max.y - box.min.y;
+        const rawSizeZ = box.max.z - box.min.z;
+        const rawMaxDim = Math.max(rawSizeX, rawSizeY, rawSizeZ);
+
+        if (rawMaxDim > 0) {
+            // Target size
+            const targetSize = Math.max(params.width, params.height, params.depth);
+
+            // If the raw mesh is tiny (e.g. -1..1 range), this scales it up.
+            // If it's 0..resolution, this scales it correctly.
+            const scale = targetSize / rawMaxDim;
+            geo.scale(scale, scale, scale);
+
+            console.log(`Gooey: Scaled by ${scale.toFixed(3)} (Raw: ${rawMaxDim.toFixed(2)} -> Target: ${targetSize})`);
+        }
+
+        geo.userData = {
+            strutCount: segments.length,
+            volume: 'N/A (Implicit)'
+        };
+        console.timeEnd('GooeyGen');
+        return geo;
     }
 
     static getDensityFactor(params, x, y, z) {
@@ -255,148 +392,6 @@ export class LatticeGenerator {
         });
     }
 
-    static generateGyroid(params) {
-        const { width, height, depth, cellSize, wallThickness } = params;
-
-        // Resolution: how many voxels?
-        // Optimized for performance
-        const samplesPerCell = 4; // Reduced from 8
-        const resX = Math.floor(width / cellSize * samplesPerCell);
-        const resY = Math.floor(height / cellSize * samplesPerCell);
-        const resZ = Math.floor(depth / cellSize * samplesPerCell);
-
-        // Three.js MarchingCubes expects a single resolution integer (cubic grid usually).
-        const maxDim = Math.max(resX, resY, resZ);
-        // Limit resolution to avoid Main Thread freeze (60^3 = 216k, 100^3 = 1M)
-        const resolution = Math.min(maxDim, 64);
-
-        const mc = new MarchingCubes(resolution, null, true, true);
-
-        // Setup field
-        // mc.field is Float32Array of size resolution^3
-        // We need to fill it.
-        // We need to map grid index (i,j,k) to world coordinates (x,y,z).
-        // World bounds: [-width/2, width/2] etc.
-
-        const scale = 2 * Math.PI / cellSize; // One period per cell size
-
-        // Threshold:
-        // Gyroid(x,y,z) = 0 is the center surface.
-        // To get thickness, we want a volume.
-        // Marching cubes generates a surface at a specific value (isolation).
-        // If we want a solid sheet with thickness, we typically define the field as:
-        // Value = (sin...)^2 ? Or abs(sin...)?
-        // If field = sin(x)cos(y) + ..., range is [-1.5, 1.5] approx.
-        // If we set isolation = 0, we get the middle surface (thin).
-        // If we want thickness, we can't easily do it with single isosurface UNLESS we render "solid" volume?
-        // But we need a mesh.
-        // Option A: Two surfaces (isolevel = t and isolevel = -t).
-        // Option B: Field = abs(gyroid) and isolevel = t. 
-        // This creates a double-walled surface (a "hull" around the zero-level set).
-        // This represents a "thick" gyroid sheet.
-        // Let's use Option B.
-
-        // wallThickness is in mm.
-        // The gradient of gyroid function varies, so thickness isn't constant in mm with a constant threshold.
-        // But it's a good approximation.
-        // Threshold approx: t_iso ~ t_mm * gradient_magnitude? 
-        // Let's just use an empirical factor relative to cellSize/scale.
-        // t_iso = wallThickness / cellSize * factor?
-        const baseThreshold = Math.max(0.1, (wallThickness / cellSize) * 1.5); // Tune this
-
-        const f = mc.field;
-
-        // Iterate over the MC grid
-        // MC grid is 0..resolution
-        for (let k = 0; k < resolution; k++) {
-            for (let j = 0; j < resolution; j++) {
-                for (let i = 0; i < resolution; i++) {
-                    // Normalize to [0,1]
-                    const u = i / resolution;
-                    const v = j / resolution;
-                    const w = k / resolution;
-
-                    // Map to 3D bounds
-                    // We want to cover the whole volume passed in params.
-                    // But MC assumes a cube volume typically.
-                    // If width != height, we need to mask?
-                    // Let's map u,v,w to ACTUAL world coordinates.
-                    const x = (u - 0.5) * width; // This assumes width corresponds to resolution?
-                    // Wait, if resolution is square (cube), but width/height are different...
-                    // We should map u to range [-width/2, width/2] IF we treat i as going from 0 to resX?
-                    // But resolution denotes the side of the container.
-                    // Let's simply map u -> [-size/2, size/2] where size is max dimension.
-                    // And clip/mask if outside actual bounds?
-                    // Or simpler: Just calculate the gyroid value.
-
-                    const size = Math.max(width, height, depth);
-                    const wx = (u - 0.5) * size;
-                    const wy = (v - 0.5) * size;
-                    const wz = (w - 0.5) * size;
-
-                    // Clip if outside bounds
-                    if (Math.abs(wx) > width / 2 || Math.abs(wy) > height / 2 || Math.abs(wz) > depth / 2) {
-                        // Outside bounds: make value > threshold so it's "empty" (or < threshold to be empty?)
-                        // If we use abs(gyroid) < threshold => Solid.
-                        // So outside, we want abs(gyroid) > threshold.
-                        // f[...] = threshold + 1.0;
-                        // Actually, marching cubes in three.js:
-                        // isolation level is usually used.
-                        // Simple logic:
-                        // We want solid if val < isolevel.
-                        // So outside, val = isolevel + 1.
-                        const idx = i + j * resolution + k * resolution * resolution;
-                        f[idx] = baseThreshold * 2.0; // Ensure outside is "empty"
-                        continue;
-                    }
-
-                    const xx = wx * scale;
-                    const yy = wy * scale;
-                    const zz = wz * scale;
-
-                    const val = Math.sin(xx) * Math.cos(yy) + Math.sin(yy) * Math.cos(zz) + Math.sin(zz) * Math.cos(xx);
-                    const absVal = Math.abs(val);
-
-                    // Variable Density for Gyroid
-                    const densityFactor = this.getDensityFactor(params, wx, wy, wz);
-
-                    // We want the effective threshold to be `baseThreshold * densityFactor`.
-                    // Marching Cubes extracts the isosurface where `field_value == isolation_level`.
-                    // If we want `absVal < baseThreshold * densityFactor` to be solid,
-                    // and we set `mc.isolation = baseThreshold`,
-                    // then we need to store `absVal / densityFactor` in the field.
-                    // So, `absVal / densityFactor < baseThreshold` is equivalent to `absVal < baseThreshold * densityFactor`.
-                    const idx = i + j * resolution + k * resolution * resolution;
-                    f[idx] = absVal / (densityFactor + 0.0001); // Add small epsilon to avoid division by zero if densityFactor is 0
-                }
-            }
-        }
-
-        mc.isolation = baseThreshold;
-        mc.update(); // Generates geometry
-
-        if (!mc.geometry) return new THREE.BufferGeometry();
-
-        // The generated geometry is inside the MC object relative to unit?
-        // MC generates geometry in range [-1, 1] or similar?
-        // Three.js MC typically creates geometry in range [-width/2, width/2]? 
-        // Need to check scaling. 
-        // Looking at source: it generates vertices based on grid index.
-        // We probably need to scale it back to `size`.
-        // The default implementation might maintain the container scope.
-        // Let's assume it needs scaling or just returning it is fine?
-        // Usually MC.js doesn't auto-scale the geometry to world units unless configured.
-        // It produces coords in range [0, 1] or [0, resolution]?
-        // Let's handle Scale.
-
-        const geo = mc.geometry.clone();
-        geo.userData = {
-            strutCount: 0,
-            volume: 'N/A (Surface)'
-        };
-        return geo;
-    }
-
     // Abstract iterator to reduce boilerplate
     static generateStrutLattice(params, cellFunction) {
         const { width, height, depth, cellSize, wallThickness } = params;
@@ -435,17 +430,19 @@ export class LatticeGenerator {
             }
         }
 
-        if (geometries.length === 0) return new THREE.BufferGeometry();
+        const validGeos = geometries.filter(g => g && g.attributes && g.attributes.position && g.attributes.position.count > 0);
 
         // Calculate Stats
         let totalVolume = 0;
-        geometries.forEach(g => {
+        validGeos.forEach(g => {
             if (g.userData && g.userData.volume) {
                 totalVolume += g.userData.volume;
             }
         });
 
-        const merged = mergeGeometries(geometries);
+        if (validGeos.length === 0) return new THREE.BufferGeometry();
+
+        const merged = mergeGeometries(validGeos);
         merged.userData = {
             strutCount: geometries.length,
             volume: totalVolume
@@ -639,8 +636,9 @@ export class LatticeGenerator {
         const distance = vStart.distanceTo(vEnd);
         const position = vEnd.clone().add(vStart).divideScalar(2);
 
-        // const material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
-        const geometry = new THREE.CylinderGeometry(radius, radius, distance, 6, 1, false); // Reduced segments for perf
+        // Cylinder (Strut body)
+        // Set openEnded = true because we are capping with spheres
+        const geometry = new THREE.CylinderGeometry(radius, radius, distance, 6, 1, true);
 
         // Orientation
         const orientation = new THREE.Matrix4();
@@ -649,15 +647,26 @@ export class LatticeGenerator {
         offsetRotation.makeRotationX(Math.PI / 2);
         orientation.multiply(offsetRotation);
         geometry.applyMatrix4(orientation);
-
         geometry.translate(position.x, position.y, position.z);
 
-        // Stats
-        geometry.userData = {
-            volume: Math.PI * radius * radius * distance
+        // Spheres (Joints)
+        // Low poly spheres for performance (8 width seg, 6 height seg)
+        const sphereGeo = new THREE.SphereGeometry(radius, 8, 6);
+        const sphereStart = sphereGeo.clone();
+        sphereStart.translate(vStart.x, vStart.y, vStart.z);
+
+        const sphereEnd = sphereGeo.clone();
+        sphereEnd.translate(vEnd.x, vEnd.y, vEnd.z);
+
+        // Merge
+        const merged = mergeGeometries([geometry, sphereStart, sphereEnd]);
+
+        // Stats (Approximate, ignores overlap)
+        merged.userData = {
+            volume: (Math.PI * radius * radius * distance) + (2 * (4 / 3 * Math.PI * Math.pow(radius, 3)))
         };
 
-        return geometry;
+        return merged;
     }
 
     static generateCubic(params) {
